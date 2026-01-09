@@ -30,9 +30,15 @@
  */
 
 // Configuration - Replace these with your values
-const DOCUMENT_ID = '1sb3UZBaaaBYN_XiI0f6L7eMZF_8sKFIkaaaaaGCWMs'; 
-const ROOT_FOLDER_ID = '11Kjaaaqp-OksLxj_PSI0qd15aaaaa4pX';         
-const LOG_SHEET_ID = '1jkqONaaaXNLJTYEkMOEu9W4b4pU79fd4HNsaaaabFA8'; 
+const DOCUMENT_ID = '1sb3UZBaaaBYN_XiI0f6L7eMZF_8sKFIkaaaaaGCWMs';
+const ROOT_FOLDER_ID = '11Kjaaaqp-OksLxj_PSI0qd15aaaaa4pX';
+const LOG_SHEET_ID = '1jkqONaaaXNLJTYEkMOEu9W4b4pU79fd4HNsaaaabFA8';
+
+// Filename Naming Convention
+// Example: Prefix="Resume_Vamsi_", Suffix="_v1" -> "Resume_Vamsi_TabName_v1.pdf" 
+// It'll be applied for all the pdfs that're created.
+const FILENAME_PREFIX = 'Resume_Vamsi_Alluri_'; // Leave empty string '' if not needed
+const FILENAME_SUFFIX = '';                    // Leave empty string '' if not needed
 
 // Rate limiting configuration
 const DELAY_BETWEEN_EXPORTS = 2500; // 2.5 seconds to be safe
@@ -127,8 +133,12 @@ function processTabHierarchy(tab, parentFolder, pathArray, state, activeTabIds) 
   const storedTitle = state[tabId].title;
   if (storedTitle && storedTitle !== tabTitle) {
     Logger.log(`📝 Rename detected: "${storedTitle}" -> "${tabTitle}"`);
+    
+    const newFileName = `${FILENAME_PREFIX}${tabTitle}${FILENAME_SUFFIX}.pdf`;
+    
     // Attempt rename in Drive
-    if (state[tabId].fileId) safeRenameFile(state[tabId].fileId, `${tabTitle}.pdf`);
+    if (state[tabId].fileId) safeRenameFile(state[tabId].fileId, newFileName);
+    // Note: Folders usually don't get prefixes/suffixes, keeping original name for folder
     if (state[tabId].folderId) safeRenameFolder(state[tabId].folderId, tabTitle);
     
     state[tabId].title = tabTitle; 
@@ -329,6 +339,9 @@ function getOrCreateFolder(parentFolder, folderName) {
 function exportTabToPDF(documentId, tabId, tabTitle, folder) {
   const exportUrl = `https://docs.google.com/document/d/${documentId}/export?format=pdf&tab=${tabId}`;
   
+  // Construct new filename with prefix/suffix
+  const pdfFileName = `${FILENAME_PREFIX}${tabTitle}${FILENAME_SUFFIX}.pdf`;
+
   for (let i = 0; i <= MAX_RETRIES; i++) {
     try {
       const response = UrlFetchApp.fetch(exportUrl, {
@@ -337,10 +350,10 @@ function exportTabToPDF(documentId, tabId, tabTitle, folder) {
       });
       
       if (response.getResponseCode() === 200) {
-        const blob = response.getBlob().setName(`${tabTitle}.pdf`);
+        const blob = response.getBlob().setName(pdfFileName);
         
         // Remove existing file with same name to prevent duplicates
-        const existing = folder.getFilesByName(`${tabTitle}.pdf`);
+        const existing = folder.getFilesByName(pdfFileName);
         while (existing.hasNext()) existing.next().setTrashed(true);
         
         return folder.createFile(blob);
