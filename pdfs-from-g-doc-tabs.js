@@ -1,35 +1,12 @@
-// Create and store the document tabs in google docs into the same directory structure as in docs.
-// This script creates, updates and deletes the created files. So make sure to provide it with appropriate perms.
-// It keeps track of the files it had created with a json file similar to the below example. 
-// Other files and folders in the same directory shouldn't be affected, I didn't test this though.
-// My doc_structure_state:
-// {
-//     "t.qa3t443mbhc": {
-//         "fileId": "1mRa53nJL6uaNd000L36ULOVAYcUauW00",
-//         "folderId": "1DjLsB81LqGu000TL_QyPnKc8K0pim-00"
-//     },
-//     "t.fczrk1tvmpu2": {
-//         "fileId": "1GXLmPuiQFTi9ZcCM0005dpbuBQTBnO00",
-//         "folderId": null
-//     },
-//     "t.j8l6vh31v3ij": {
-//         "fileId": "1eEtDJ17nq1aNG000HbQ30S8P9llV8L00",
-//         "folderId": "1kX5VHY3KJ2B000t2ek8e__5g8BgowR00"
-//     },
-//   ..... so on
-// }
-// Deletes the file if there is a tabId missing in the document and,
-// checks if there is a folder with the same name, and empty - deletes it as well.
-
-
 // Configuration - Replace these with your values
-const DOCUMENT_ID = '1sb3UZBOm000_XiI0f6L7eMZF_8sKFIkWCHm0000000'; // Your Google Doc ID
-const ROOT_FOLDER_ID = '11Kjl9000-OksLxj_PSI0qd15a0000000';     // Your Drive folder ID
+const DOCUMENT_ID = 'configs'; // Your Google Doc ID
+const ROOT_FOLDER_ID = 'configs';         // Your Drive folder ID 
+const LOG_SHEET_ID = 'configs'; // <--- UPDATED WITH YOUR ID
 
 // Rate limiting configuration
-const DELAY_BETWEEN_EXPORTS = 2000; // 2 seconds between each export
-const MAX_RETRIES = 5; // Maximum retry attempts for 429 errors
-const INITIAL_BACKOFF = 1000; // Initial backoff delay (1 second)
+const DELAY_BETWEEN_EXPORTS = 2000; 
+const MAX_RETRIES = 5; 
+const INITIAL_BACKOFF = 1000; 
 
 const SCRIPT_PROPERTIES = PropertiesService.getScriptProperties();
 const STATE_KEY = 'doc_structure_state'; // Key to store the JSON map of TabID -> DriveID
@@ -38,7 +15,7 @@ const STATE_KEY = 'doc_structure_state'; // Key to store the JSON map of TabID -
 const LOCK_KEY = 'script_mutex_lock';
 // Safety timeout: If the lock is older than this (10 mins), assume previous run crashed and take over.
 // Google Scripts have a max runtime of 6 mins, so 10 mins is a safe buffer.
-const LOCK_TIMEOUT_MS = 10 * 60 * 1000; 
+const LOCK_TIMEOUT_MS = 8 * 60 * 1000; 
 
 function exportUpdatedTabsToPDF() {
   const now = Date.now();
@@ -47,17 +24,16 @@ function exportUpdatedTabsToPDF() {
   // 1. Check if locked
   if (lockValue) {
     const lockTime = parseInt(lockValue, 10);
-    // Check if the lock is "fresh"
     if (now - lockTime < LOCK_TIMEOUT_MS) {
-      Logger.log('⚠️ Script is already running (Locked). Exiting to prevent overlap.');
+      Logger.log('⚠️ Script is already running (Locked). Exiting.');
       return;
     } else {
-      Logger.log('⚠️ Found stale lock from previous crash. Taking over lock.');
+      Logger.log('⚠️ Found stale lock. Taking over.');
+      logToSheet('System', 'Stale lock detected. Taking over execution.', 'Warning');
     }
   }
 
-  // 2. Set Lock (Mutex)
-  // We store the current timestamp so future runs can detect stale locks
+  // 2. Set Lock
   SCRIPT_PROPERTIES.setProperty(LOCK_KEY, now.toString());
 
   try {
@@ -67,39 +43,36 @@ function exportUpdatedTabsToPDF() {
     const doc = DocumentApp.openById(DOCUMENT_ID);
     const rootFolder = DriveApp.getFolderById(ROOT_FOLDER_ID);
     
-    // Load the previous state
+    // Load state
     let state = getStoredState();
-    const activeTabIds = new Set(); // Track IDs seen in this run
+    const activeTabIds = new Set(); 
 
     const topLevelTabs = doc.getTabs();
     let exportCount = 0;
     
-    // Process hierarchy and update 'state' with current File IDs
+    // Process hierarchy
     topLevelTabs.forEach(tab => {
       if (tab.getType() === DocumentApp.TabType.DOCUMENT_TAB) {
         exportCount += processTabHierarchy(tab, rootFolder, [], state, activeTabIds);
       }
     });
 
-    // Cleanup Phase: Detect removed tabs and delete their files
+    // Cleanup Phase
     cleanupOrphans(state, activeTabIds);
 
-    // Save the updated state
+    // Save state
     SCRIPT_PROPERTIES.setProperty(STATE_KEY, JSON.stringify(state));
     
     // Update last check time
     SCRIPT_PROPERTIES.setProperty('lastDocumentCheck', Date.now().toString());
     
-    Logger.log(`Run completed. Exported: ${exportCount}. Updated state saved.`);
-    // --- END MAIN LOGIC ---
-
+    Logger.log(`Run completed. Exported: ${exportCount}.`);
+    logToSheet('Info', `Run completed. ${exportCount} files exported.`, 'Success');
   } catch (e) {
-    Logger.log(`❌ Error during execution: ${e.message}`);
-    // Optional: Re-throw if you want it to appear as Failed in the Apps Script dashboard
-    // throw e; 
+    Logger.log(`❌ Error: ${e.message}`);
+    logToSheet('Error', e.message, 'Failed');
   } finally {
     // 3. Release Lock
-    // This block executes whether the script succeeds or fails
     SCRIPT_PROPERTIES.deleteProperty(LOCK_KEY);
     Logger.log('🔓 Lock released.');
   }
@@ -110,54 +83,107 @@ function processTabHierarchy(tab, parentFolder, pathArray, state, activeTabIds) 
   const tabTitle = tab.getTitle();
   let exportCount = 0;
   
-  // Mark this tab ID as "seen" (Active)
   activeTabIds.add(tabId);
 
-  // Initialize state entry if missing
-  if (!state[tabId]) state[tabId] = { fileId: null, folderId: null };
+  // Initialize state if missing
+  if (!state[tabId]) state[tabId] = { fileId: null, folderId: null, title: tabTitle };
   
-  // Get content hash
+  let stateDirty = false; // Track if we need to save changes
+
+  // 1. SYNC TITLES (Handle Renaming)
+  const storedTitle = state[tabId].title;
+  if (storedTitle && storedTitle !== tabTitle) {
+    Logger.log(`📝 Rename detected: "${storedTitle}" -> "${tabTitle}"`);
+    
+    if (state[tabId].fileId) {
+      try { DriveApp.getFileById(state[tabId].fileId).setName(`${tabTitle}.pdf`); } 
+      catch (e) { console.warn('Could not rename file', e); }
+    }
+    if (state[tabId].folderId) {
+      try { DriveApp.getFolderById(state[tabId].folderId).setName(tabTitle); } 
+      catch (e) { console.warn('Could not rename folder', e); }
+    }
+    state[tabId].title = tabTitle; 
+    stateDirty = true; // Mark for save
+  }
+
+  // 2. CHECK CONTENT
   const currentHash = getTabContentHash(tab);
   const storedHashKey = `hash_${tabId}`;
   const storedHash = SCRIPT_PROPERTIES.getProperty(storedHashKey);
   const contentChanged = (currentHash !== storedHash);
   
-  let currentFileId = state[tabId].fileId;
-
-  if (contentChanged || !currentFileId) {
-    // Export needed
+  if (contentChanged || !state[tabId].fileId) {
+    const fullPath = pathArray.concat(tabTitle).join(' > ');
     const exportedFile = exportTabToPDF(DOCUMENT_ID, tabId, tabTitle, parentFolder);
     
     if (exportedFile) {
-      // Store the new hash
+      // Update Hash immediately
       SCRIPT_PROPERTIES.setProperty(storedHashKey, currentHash);
       
-      // Update state with new File ID
+      // Update State
       state[tabId].fileId = exportedFile.getId();
+      state[tabId].title = tabTitle;
       
-      const fullPath = pathArray.concat(tabTitle).join(' > ');
-      Logger.log(`✓ Exported (changed/new): ${fullPath}`);
       exportCount++;
+      stateDirty = true; // Mark for save
+      
+      Logger.log(`✓ Exported: ${fullPath}`);
       Utilities.sleep(DELAY_BETWEEN_EXPORTS);
-    } else {
-      const fullPath = pathArray.concat(tabTitle).join(' > ');
-      Logger.log(`✗ Failed to export: ${fullPath}`);
     }
   } else {
-    const fullPath = pathArray.concat(tabTitle).join(' > ');
-    Logger.log(`○ Skipped (unchanged): ${fullPath}`);
+    // 3. SYNC LOCATION (Move Logic)
+    if (state[tabId].fileId) {
+      try {
+        const file = DriveApp.getFileById(state[tabId].fileId);
+        // Only move if not in correct folder
+        const parents = file.getParents();
+        let isCorrect = false;
+        while (parents.hasNext()) { if (parents.next().getId() === parentFolder.getId()) isCorrect = true; }
+        
+        if (!isCorrect) {
+          moveItemToFolder(file, parentFolder);
+          // No need to update 'state' here as IDs didn't change, just location
+        }
+      } catch (e) {
+        Logger.log(`Warning: Could not check/move file ${state[tabId].fileId}`);
+      }
+    }
   }
-  
-  // Process Children
+
+  // --- CRITICAL FIX: INCREMENTAL SAVE ---
+  // If we changed the state (Renamed or Exported), save it NOW.
+  if (stateDirty) {
+    SCRIPT_PROPERTIES.setProperty(STATE_KEY, JSON.stringify(state));
+  }
+  // --------------------------------------
+
+  // 4. PROCESS CHILDREN
   const childTabs = tab.getChildTabs();
-  
   if (childTabs.length > 0) {
-    // Create/get subfolder for this tab's children
-    const subFolder = getOrCreateFolder(parentFolder, tabTitle);
+    let subFolder;
+    let folderIdChanged = false;
+
+    if (state[tabId].folderId) {
+      try {
+        subFolder = DriveApp.getFolderById(state[tabId].folderId);
+        moveItemToFolder(subFolder, parentFolder); 
+      } catch (e) {
+        subFolder = getOrCreateFolder(parentFolder, tabTitle);
+        state[tabId].folderId = subFolder.getId();
+        folderIdChanged = true;
+      }
+    } else {
+      subFolder = getOrCreateFolder(parentFolder, tabTitle);
+      state[tabId].folderId = subFolder.getId();
+      folderIdChanged = true;
+    }
     
-    // Track the folder ID in the state so we can clean it up later if empty
-    state[tabId].folderId = subFolder.getId();
-    
+    // If we just created a new folder ID, save state immediately
+    if (folderIdChanged) {
+      SCRIPT_PROPERTIES.setProperty(STATE_KEY, JSON.stringify(state));
+    }
+
     childTabs.forEach(childTab => {
       if (childTab.getType() === DocumentApp.TabType.DOCUMENT_TAB) {
         exportCount += processTabHierarchy(childTab, subFolder, pathArray.concat(tabTitle), state, activeTabIds);
@@ -166,6 +192,37 @@ function processTabHierarchy(tab, parentFolder, pathArray, state, activeTabIds) 
   }
   
   return exportCount;
+}
+
+/**
+ * Moves a File or Folder to the target folder if it isn't already there.
+ * This fixes "Duplicates" by removing it from the old location.
+ */
+function moveItemToFolder(item, targetFolder) {
+  const parents = item.getParents();
+  let isAlreadyHere = false;
+  
+  // Check current parents
+  while (parents.hasNext()) {
+    const parent = parents.next();
+    if (parent.getId() === targetFolder.getId()) {
+      isAlreadyHere = true;
+    } else {
+      // Remove from old parent (This fixes the duplication/ghosting)
+      try { parent.removeFile(item); } catch (e) { 
+        // Try removing as folder if file fails (API quirk)
+        try { parent.removeFolder(item); } catch(e2) {}
+      }
+    }
+  }
+  
+  // Add to new parent if needed
+  if (!isAlreadyHere) {
+    try { targetFolder.addFile(item); } catch (e) {
+       try { targetFolder.addFolder(item); } catch(e2) {}
+    }
+    Logger.log(`Moved item "${item.getName()}" to folder "${targetFolder.getName()}"`);
+  }
 }
 
 /**
@@ -181,30 +238,32 @@ function cleanupOrphans(state, activeTabIds) {
       const orphanData = state[tabId];
       Logger.log(`Detected removed tab (ID: ${tabId}). Cleaning up...`);
 
-      // 1. Delete the PDF File
+      // 1. Delete PDF
       if (orphanData.fileId) {
         try {
           const file = DriveApp.getFileById(orphanData.fileId);
+          const fileName = file.getName();
           file.setTrashed(true);
-          Logger.log(`  - Deleted PDF: ${file.getName()}`);
+          Logger.log(` - Deleted PDF: ${fileName}`);
+          logToSheet('Cleanup', `Deleted PDF: ${fileName}`, 'Success');
         } catch (e) {
-          Logger.log(`  - PDF already gone or inaccessible (ID: ${orphanData.fileId})`);
+            logToSheet('Cleanup', `PDF missing/inaccessible (ID: ${orphanData.fileId})`, 'Warning');
         }
       }
 
-      // 2. Delete the Subfolder (if it existed and is now empty)
+      // 2. Delete Subfolder
       if (orphanData.folderId) {
         try {
           const folder = DriveApp.getFolderById(orphanData.folderId);
           // Only delete if empty to be safe
           if (!folder.getFiles().hasNext() && !folder.getFolders().hasNext()) {
+            const folderName = folder.getName();
             folder.setTrashed(true);
-            Logger.log(`  - Deleted empty folder: ${folder.getName()}`);
-          } else {
-            Logger.log(`  - Folder not empty, skipped deletion: ${folder.getName()}`);
+            Logger.log(` - Deleted empty folder: ${folderName}`);
+            logToSheet('Cleanup', `Deleted empty folder: ${folderName}`, 'Success'); 
           }
         } catch (e) {
-          Logger.log(`  - Folder already gone (ID: ${orphanData.folderId})`);
+           // Folder likely already gone
         }
       }
 
@@ -217,15 +276,33 @@ function cleanupOrphans(state, activeTabIds) {
   });
 }
 
+/**
+ * Helper function to append logs to the Google Sheet
+ */
+function logToSheet(actionType, message, status) {
+  try {
+    if (!LOG_SHEET_ID) return;
+    
+    const sheet = SpreadsheetApp.openById(LOG_SHEET_ID).getSheets()[0];
+    const timestamp = new Date().toLocaleString();
+    
+    // Check if headers exist, if not create them (Optional, good for first run)
+    if (sheet.getLastRow() === 0) {
+        sheet.appendRow(['Timestamp', 'Action Type', 'Message', 'Status']);
+    }
+
+    sheet.appendRow([timestamp, actionType, message, status]);
+  } catch (e) {
+    Logger.log(`Failed to write to log sheet: ${e.message}`);
+  }
+}
+
+// ... (Standard Helpers below this line) ...
+
 function getStoredState() {
   const json = SCRIPT_PROPERTIES.getProperty(STATE_KEY);
   if (!json) return {};
-  try {
-    return JSON.parse(json);
-  } catch (e) {
-    Logger.log('Error parsing state, resetting.');
-    return {};
-  }
+  try { return JSON.parse(json); } catch (e) { return {}; }
 }
 
 function getTabContentHash(tab) {
@@ -241,14 +318,10 @@ function getTabContentHash(tab) {
 
 function getOrCreateFolder(parentFolder, folderName) {
   const existingFolders = parentFolder.getFoldersByName(folderName);
-  if (existingFolders.hasNext()) {
-    return existingFolders.next();
-  } else {
-    return parentFolder.createFolder(folderName);
-  }
+  if (existingFolders.hasNext()) return existingFolders.next();
+  return parentFolder.createFolder(folderName);
 }
 
-// Modified to return the File object on success, null on failure
 function exportTabToPDF(documentId, tabId, tabTitle, folder) {
   const exportUrl = `https://docs.google.com/document/d/${documentId}/export?format=pdf&tab=${tabId}`;
   
@@ -266,27 +339,17 @@ function exportTabToPDF(documentId, tabId, tabTitle, folder) {
         
         // Check if file already exists and replace it
         const existingFiles = folder.getFilesByName(pdfFileName);
-        if (existingFiles.hasNext()) {
-          const existingFile = existingFiles.next();
-          existingFile.setTrashed(true);
-        }
-        
-        // Create new file and return it
+        if (existingFiles.hasNext()) existingFiles.next().setTrashed(true);
         return folder.createFile(blob); 
       }
-      
-      if (response.getResponseCode() === 429) {
-        if (attempt < MAX_RETRIES) {
-          const backoffDelay = INITIAL_BACKOFF * Math.pow(2, attempt);
-          Utilities.sleep(backoffDelay);
-          continue;
-        }
+      if (response.getResponseCode() === 429 && attempt < MAX_RETRIES) {
+        Utilities.sleep(INITIAL_BACKOFF * Math.pow(2, attempt));
+        continue;
       }
       return null;
     } catch (e) {
       if (attempt < MAX_RETRIES) {
-        const backoffDelay = INITIAL_BACKOFF * Math.pow(2, attempt);
-        Utilities.sleep(backoffDelay);
+        Utilities.sleep(INITIAL_BACKOFF * Math.pow(2, attempt));
         continue;
       }
       return null;
