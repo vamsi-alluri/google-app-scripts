@@ -1,82 +1,97 @@
 /**
- * Google Docs Tab to Drive PDF Exporter
- * * 1. SYNC: Creates and stores document tabs from a Google Doc into Google Drive.
- * - Mirrors the hierarchical structure of the Doc (Child Tabs -> Subfolders).
- * - Updates PDFs if the tab content changes (MD5 Hash check).
- * - Renames PDFs and Folders if the Tab is renamed.
- * - Moves PDFs and Folders if the Tab is moved to a different parent in the Doc.
- * * 2. CLEANUP: Handles deletions automatically.
- * - If a tab is deleted from the Doc, the corresponding PDF is trashed.
- * - If a folder becomes empty after deletion, the folder is trashed.
- * * 3. STATE: Keeps track of files using a JSON object in Script Properties.
- * - This prevents duplicate exports and allows the script to "resume" if it crashes.
- * - State Example:
- * {
- * "t.qa3t443mbhc": {
- * "fileId": "1mRa53nJL6uaNd000L36ULOVAYcUauW00",
- * "folderId": "1DjLsB81LqGu000TL_QyPnKc8K0pim-00",
- * "title": "My Tab Name",
- * "parentName": "Parent Section Name"
- * },
- * "t.fczrk1tvmpu2": {
- * "fileId": "1GXLmPuiQFTi9ZcCM0005dpbuBQTBnO00",
- * "folderId": null,
- * "title": "Orphan Tab",
- * "parentName": "ROOT"
- * }
- * }
- * * 4. PERMISSIONS: Ensure this script has Edit access to the target Drive Folder.
- * Note: Other files in the target directory are ignored/unaffected.
+ * Google Docs Tab to Drive PDF Exporter & Markdown Syncer
+ * * FEATURES:
+ * 1. SYNC: Mirrors Doc Tabs -> Drive Folders/PDFs.
+ * 2. MARKDOWN: Generates Markdown from Tabs -> Google Sheet.
+ * 3. CLEANUP: Handles deletions (Trashes PDFs, Archives Sheet Rows).
+ * 4. STATE: Tracks structure to prevent duplicate work.
  */
 
-// Configuration - Replace these with your values
-const DOCUMENT_ID = '1sb3UZBaaaBYN_XiI0f6L7eMZF_8sKFIkaaaaaGCWMs';
-const ROOT_FOLDER_ID = '11Kjaaaqp-OksLxj_PSI0qd15aaaaa4pX';
-const LOG_SHEET_ID = '1jkqONaaaXNLJTYEkMOEu9W4b4pU79fd4HNsaaaabFA8';
+// ================= CONFIGURATION =================
+const DOCUMENT_ID = ''; 
+const ROOT_FOLDER_ID = '';         
+const LOG_SHEET_ID = ''; 
+// Sheet for Markdown content
+const MARKDOWN_SHEET_ID = ''; 
 
-// Filename Naming Convention
-// Example: Prefix="Resume_Vamsi_", Suffix="_v1" -> "Resume_Vamsi_TabName_v1.pdf" 
-// It'll be applied for all the pdfs that're created.
-const FILENAME_PREFIX = 'Resume_Vamsi_Alluri_'; // Leave empty string '' if not needed
-const FILENAME_SUFFIX = '';                    // Leave empty string '' if not needed
+const FILENAME_PREFIX = ''; 
+const FILENAME_SUFFIX = '';                    
 
-// Rate limiting configuration
-const DELAY_BETWEEN_EXPORTS = 2500; // 2.5 seconds to be safe
+const DELAY_BETWEEN_EXPORTS = 2500; 
 const MAX_RETRIES = 3; 
 const INITIAL_BACKOFF = 1500; 
 
+// ================= INTERNAL CONSTANTS =================
 const SCRIPT_PROPERTIES = PropertiesService.getScriptProperties();
 const STATE_KEY = 'doc_structure_state'; 
 const LOCK_KEY = 'script_mutex_lock';
-const LOCK_TIMEOUT_MS = 9 * 60 * 1000; // 9 mins (Safe buffer for 6 min runtime)
+const LOCK_TIMEOUT_MS = 9 * 60 * 1000; 
 
-function exportUpdatedTabsToPDF() {
-  const now = Date.now();
+// ================= LOCK MANAGEMENT =================
+let CURRENT_LOCK_TIMESTAMP = null;
+
+function lockCheck() {
   const lockValue = SCRIPT_PROPERTIES.getProperty(LOCK_KEY);
-
-  // 1. Mutex Lock Check
-  if (lockValue) {
-    const lockTime = parseInt(lockValue, 10);
-    // If lock is older than timeout, assume crash and take over
-    if (now - lockTime < LOCK_TIMEOUT_MS) {
-      Logger.log('⚠️ Script is already running (Locked). Exiting.');
-      return;
-    } else {
-      logToSheet('System', 'Stale lock detected. Taking over.', 'Warning');
-    }
+  
+  if (!lockValue) {
+    return true; // No lock exists, safe to proceed
   }
+  
+  const lockTime = parseInt(lockValue, 10);
+  
+  // If this process owns the lock, allow it
+  if (CURRENT_LOCK_TIMESTAMP !== null && lockTime === CURRENT_LOCK_TIMESTAMP) {
+    Logger.log('✓ Lock owned by this process.');
+    return true;
+  }
+  
+  // Check if lock is stale
+  const now = Date.now();
+  if (now - lockTime >= LOCK_TIMEOUT_MS) {
+    logToSheet('System', 'Stale lock detected.', 'Warning');
+    return true; // Stale lock, can take over
+  }
+  
+  // Active lock from another process
+  Logger.log('⚠️ Script is already running (Locked by another process). Exiting.');
+  return false;
+}
 
-  // 2. Set Lock
+function lockSet() {
+  const now = Date.now();
   SCRIPT_PROPERTIES.setProperty(LOCK_KEY, now.toString());
+  CURRENT_LOCK_TIMESTAMP = now;
+  Logger.log('🔒 Lock set.');
+}
+
+function lockRelease() {
+  SCRIPT_PROPERTIES.deleteProperty(LOCK_KEY);
+  CURRENT_LOCK_TIMESTAMP = null;
+  Logger.log('🔓 Lock released.');
+}
+
+// ================= EXPORT LOGIC =================
+function exportUpdatedTabsToPDF() {
+  // 1 Lock Check:
+  if (!lockCheck()){
+    return;
+  }
+  // 2 Set the lock.
+  if (CURRENT_LOCK_TIMESTAMP === null){
+    lockSet();
+  }
 
   try {
     Logger.log('🔒 Lock acquired. Starting export...');
+    
     const doc = DocumentApp.openById(DOCUMENT_ID);
     const rootFolder = DriveApp.getFolderById(ROOT_FOLDER_ID);
     
-    // Load state
     let state = getStoredState();
     const activeTabIds = new Set(); 
+    
+    // Pre-load Sheet Map to prevent duplicates
+    const markdownSheetMap = getMarkdownSheetRowMap();
 
     const topLevelTabs = doc.getTabs();
     let exportCount = 0;
@@ -84,143 +99,128 @@ function exportUpdatedTabsToPDF() {
     // Process hierarchy
     topLevelTabs.forEach(tab => {
       if (tab.getType() === DocumentApp.TabType.DOCUMENT_TAB) {
-        // Path starts empty for top level
-        exportCount += processTabHierarchy(tab, rootFolder, [], state, activeTabIds);
+        exportCount += processTabHierarchy(tab, rootFolder, [], state, activeTabIds, markdownSheetMap);
       }
     });
 
-    // Cleanup Phase: Delete files for tabs that no longer exist
-    cleanupOrphans(state, activeTabIds);
+    cleanupOrphans(state, activeTabIds, markdownSheetMap);
 
-    // Save final state (Cleaned up version)
     SCRIPT_PROPERTIES.setProperty(STATE_KEY, JSON.stringify(state));
     SCRIPT_PROPERTIES.setProperty('lastDocumentCheck', Date.now().toString());
     
-    Logger.log(`Run completed. Exported: ${exportCount}.`);
-    if (exportCount > 0) logToSheet('Info', `Run completed. ${exportCount} files exported.`, 'Success');
+    Logger.log(`Run completed. Processed: ${exportCount}.`);
+    if (exportCount > 0) logToSheet('Info', `Run completed. ${exportCount} items processed.`, 'Success');
     
   } catch (e) {
     Logger.log(`❌ Error: ${e.message}`);
     logToSheet('Error', e.message, 'Failed');
   } finally {
-    // 3. Release Lock
-    SCRIPT_PROPERTIES.deleteProperty(LOCK_KEY);
-    Logger.log('🔓 Lock released.');
+    lockRelease();
   }
 }
 
-function processTabHierarchy(tab, parentFolder, pathArray, state, activeTabIds) {
+function processTabHierarchy(tab, parentFolder, pathArray, state, activeTabIds, markdownSheetMap) {
   const tabId = tab.getId();
   const tabTitle = tab.getTitle();
   let exportCount = 0;
   
   activeTabIds.add(tabId);
 
-  // Initialize state if missing
+  // Init State
   if (!state[tabId]) state[tabId] = { fileId: null, folderId: null, title: tabTitle, parentName: null };
-  
   let stateDirty = false;
 
-  // --- 1. PARENT/STRUCTURE CHECK (The Optimization) ---
-  // pathArray contains parent titles. The last one is the direct parent.
+  // 1. Structure Check
   const currentParentName = pathArray.length > 0 ? pathArray[pathArray.length - 1] : 'ROOT';
   const savedParentName = state[tabId].parentName;
-  
-  // Flag: check drive ONLY if the parent name changed in the Doc structure
   const structureChanged = (state[tabId].fileId && currentParentName !== savedParentName);
 
-  // --- 2. RENAME CHECK ---
+  // 2. Rename Check
   const storedTitle = state[tabId].title;
   if (storedTitle && storedTitle !== tabTitle) {
-    Logger.log(`📝 Rename detected: "${storedTitle}" -> "${tabTitle}"`);
-    
+    Logger.log(`📝 Rename: "${storedTitle}" -> "${tabTitle}"`);
     const newFileName = `${FILENAME_PREFIX}${tabTitle}${FILENAME_SUFFIX}.pdf`;
     
-    // Attempt rename in Drive
     if (state[tabId].fileId) safeRenameFile(state[tabId].fileId, newFileName);
-    // Note: Folders usually don't get prefixes/suffixes, keeping original name for folder
     if (state[tabId].folderId) safeRenameFolder(state[tabId].folderId, tabTitle);
     
+    // Update Sheet Name
+    updateMarkdownSheetName(markdownSheetMap, storedTitle, tabTitle);
+
     state[tabId].title = tabTitle; 
     stateDirty = true; 
   }
 
-  // --- 3. EXPORT CHECK ---
+  // 3. Export & Sync Check
   const currentHash = getTabContentHash(tab);
   const storedHashKey = `hash_${tabId}`;
   const storedHash = SCRIPT_PROPERTIES.getProperty(storedHashKey);
   const contentChanged = (currentHash !== storedHash);
   
-  // Verify file actually exists (Self-Healing)
+  // Verify File Exists
   let fileExists = false;
   if (state[tabId].fileId) {
-    try {
-      DriveApp.getFileById(state[tabId].fileId);
-      fileExists = true;
-    } catch (e) {
-      Logger.log(`⚠️ File missing for "${tabTitle}". Will re-export.`);
-      state[tabId].fileId = null; // Reset state so we export again
-    }
+    try { DriveApp.getFileById(state[tabId].fileId); fileExists = true; } 
+    catch (e) { state[tabId].fileId = null; }
   }
 
-  if (contentChanged || !fileExists) {
-    // >> EXPORT ACTION
+  // Check if missing from Sheet (using trimmed name check)
+  const missingFromSheet = !markdownSheetMap.has(tabTitle.trim());
+
+  if (contentChanged || !fileExists || missingFromSheet) {
+    // >> ACTION: Export PDF + Generate Markdown
     const fullPath = pathArray.concat(tabTitle).join(' > ');
     const exportedFile = exportTabToPDF(DOCUMENT_ID, tabId, tabTitle, parentFolder);
     
     if (exportedFile) {
       SCRIPT_PROPERTIES.setProperty(storedHashKey, currentHash);
-      
       state[tabId].fileId = exportedFile.getId();
       state[tabId].title = tabTitle;
-      state[tabId].parentName = currentParentName; // Sync parent
+      state[tabId].parentName = currentParentName;
       
+      // Generate Markdown
+      const markdown = convertTabToMarkdown(tab);
+      const filePath = getDrivePath(exportedFile);
+      
+      // Update Sheet
+      syncToMarkdownSheet(markdownSheetMap, tabTitle, markdown, 'Active', filePath);
+
       exportCount++;
       stateDirty = true;
-      Logger.log(`✓ Exported: ${fullPath}`);
+      Logger.log(`✓ Synced: ${fullPath}`);
       Utilities.sleep(DELAY_BETWEEN_EXPORTS);
     }
-  } else {
-    // >> NO EXPORT, BUT CHECK STRUCTURE
-    // Only verify location if structureChanged is TRUE. (Saves time!)
-    if (structureChanged) {
-      Logger.log(`↻ Structure change for "${tabTitle}". Verifying location...`);
-      if (state[tabId].fileId) {
-        try {
-          const file = DriveApp.getFileById(state[tabId].fileId);
-          moveItemToFolder(file, parentFolder);
-          state[tabId].parentName = currentParentName; // Update state
-          stateDirty = true;
-        } catch (e) {
-           // File likely gone, next run will catch it
-        }
-      }
+  } else if (structureChanged) {
+    // >> ACTION: Move only
+    if (state[tabId].fileId) {
+      try {
+        const file = DriveApp.getFileById(state[tabId].fileId);
+        moveItemToFolder(file, parentFolder);
+        
+        // Update Path in Sheet
+        const filePath = getDrivePath(file);
+        syncToMarkdownSheet(markdownSheetMap, tabTitle, null, 'Active', filePath); 
+        
+        state[tabId].parentName = currentParentName;
+        stateDirty = true;
+      } catch (e) {}
     }
   }
 
-  // --- INCREMENTAL SAVE (Prevents data loss on timeout) ---
-  if (stateDirty) {
-    SCRIPT_PROPERTIES.setProperty(STATE_KEY, JSON.stringify(state));
-  }
+  if (stateDirty) SCRIPT_PROPERTIES.setProperty(STATE_KEY, JSON.stringify(state));
 
-  // --- 4. PROCESS CHILDREN ---
+  // 4. Recursion
   const childTabs = tab.getChildTabs();
-  
   if (childTabs.length > 0) {
     let subFolder;
     let folderDirty = false;
-    
-    // Check if folder needs moving (Structure Check)
     const folderNeedsMove = (state[tabId].folderId && currentParentName !== savedParentName);
 
     if (state[tabId].folderId) {
       try {
         subFolder = DriveApp.getFolderById(state[tabId].folderId);
-        if (folderNeedsMove) {
-           moveItemToFolder(subFolder, parentFolder);
-        }
+        if (folderNeedsMove) moveItemToFolder(subFolder, parentFolder);
       } catch (e) {
-        // Folder missing/deleted manually
         subFolder = getOrCreateFolder(parentFolder, tabTitle);
         state[tabId].folderId = subFolder.getId();
         folderDirty = true;
@@ -235,8 +235,7 @@ function processTabHierarchy(tab, parentFolder, pathArray, state, activeTabIds) 
 
     childTabs.forEach(childTab => {
       if (childTab.getType() === DocumentApp.TabType.DOCUMENT_TAB) {
-        // Pass current title as parent for the next level
-        exportCount += processTabHierarchy(childTab, subFolder, pathArray.concat(tabTitle), state, activeTabIds);
+        exportCount += processTabHierarchy(childTab, subFolder, pathArray.concat(tabTitle), state, activeTabIds, markdownSheetMap);
       }
     });
   }
@@ -244,64 +243,177 @@ function processTabHierarchy(tab, parentFolder, pathArray, state, activeTabIds) 
   return exportCount;
 }
 
-/**
- * Compares known state against currently active tabs.
- * Deletes files/folders for tabs that no longer exist.
- */
-function cleanupOrphans(state, activeTabIds) {
-  const allKnownTabIds = Object.keys(state);
+// ================= SHEET HELPERS (FIXED DUPLICATES) =================
+
+function getMarkdownSheetRowMap() {
+  const map = new Map();
+  if (!MARKDOWN_SHEET_ID) return map;
   
+  try {
+    const sheet = SpreadsheetApp.openById(MARKDOWN_SHEET_ID).getSheets()[0];
+    const lastRow = sheet.getLastRow();
+    
+    // If only header exists or empty
+    if (lastRow < 2) return map; 
+    
+    // Get all names in Col A (DisplayValues ensures strings)
+    const data = sheet.getRange(2, 1, lastRow, 1).getDisplayValues(); 
+    
+    data.forEach((row, index) => {
+      // TRIM whitespace to ensure accurate matching
+      const name = row[0].trim();
+      if (name) {
+        map.set(name, index + 2); // Store 1-based Row Index
+      }
+    });
+  } catch(e) {
+    Logger.log("Error reading sheet map: " + e.message);
+  }
+  return map;
+}
+
+function syncToMarkdownSheet(map, name, content, status, path) {
+  if (!MARKDOWN_SHEET_ID) return;
+  
+  // Normalize name
+  const cleanName = name.trim();
+  
+  try {
+    const sheet = SpreadsheetApp.openById(MARKDOWN_SHEET_ID).getSheets()[0];
+    
+    if (map.has(cleanName)) {
+      // >> UPDATE EXISTING ROW
+      const rowIndex = map.get(cleanName);
+      if (content !== null) sheet.getRange(rowIndex, 2).setValue(content);
+      if (status !== null) sheet.getRange(rowIndex, 3).setValue(status);
+      if (path !== null) sheet.getRange(rowIndex, 4).setValue(path);
+      Logger.log(`[Sheet] Updated row ${rowIndex} for "${cleanName}"`);
+    } else {
+      // >> APPEND NEW ROW
+      sheet.appendRow([cleanName, content || '', status, path || '']);
+      
+      // Update Map Immediately
+      const newRowIndex = sheet.getLastRow();
+      map.set(cleanName, newRowIndex);
+      Logger.log(`[Sheet] Appended row ${newRowIndex} for "${cleanName}"`);
+    }
+    // Flush to ensure data persistence
+    SpreadsheetApp.flush();
+  } catch(e) { Logger.log("Error syncing to sheet: " + e.message); }
+}
+
+function updateMarkdownSheetName(map, oldName, newName) {
+  if (!MARKDOWN_SHEET_ID) return;
+  const cleanOld = oldName.trim();
+  const cleanNew = newName.trim();
+
+  if (!map.has(cleanOld)) return;
+  
+  try {
+    const sheet = SpreadsheetApp.openById(MARKDOWN_SHEET_ID).getSheets()[0];
+    const rowIndex = map.get(cleanOld);
+    
+    sheet.getRange(rowIndex, 1).setValue(cleanNew);
+    
+    // Update Map
+    map.delete(cleanOld);
+    map.set(cleanNew, rowIndex);
+  } catch(e) {}
+}
+
+// ================= MARKDOWN GENERATOR (FIXED RUNTIME) =================
+function convertTabToMarkdown(tab) {
+  try {
+    const documentTab = tab.asDocumentTab();
+    if (!documentTab) return "";
+    const body = documentTab.getBody();
+    if (!body) return "";
+
+    let md = "";
+    // FIX: Using getNumChildren + getChild loop instead of getChildren()
+    const numChildren = body.getNumChildren();
+    
+    for (let i = 0; i < numChildren; i++) {
+      const child = body.getChild(i);
+      const type = child.getType();
+      
+      if (type === DocumentApp.ElementType.PARAGRAPH) {
+        const p = child.asParagraph();
+        const text = p.getText();
+        if (!text.trim()) { md += "\n"; continue; } 
+        
+        const heading = p.getHeading();
+        if (heading === DocumentApp.ParagraphHeading.NORMAL) {
+          md += text + "\n\n";
+        } else {
+          let prefix = "";
+          if (heading === DocumentApp.ParagraphHeading.HEADING1) prefix = "# ";
+          else if (heading === DocumentApp.ParagraphHeading.HEADING2) prefix = "## ";
+          else if (heading === DocumentApp.ParagraphHeading.HEADING3) prefix = "### ";
+          else if (heading === DocumentApp.ParagraphHeading.HEADING4) prefix = "#### ";
+          else if (heading === DocumentApp.ParagraphHeading.HEADING5) prefix = "##### ";
+          else if (heading === DocumentApp.ParagraphHeading.HEADING6) prefix = "###### ";
+          else if (heading === DocumentApp.ParagraphHeading.TITLE) prefix = "# ";
+          else if (heading === DocumentApp.ParagraphHeading.SUBTITLE) prefix = "## ";
+          md += prefix + text + "\n\n";
+        }
+      } 
+      else if (type === DocumentApp.ElementType.LIST_ITEM) {
+        const item = child.asListItem();
+        const text = item.getText();
+        const nesting = item.getNestingLevel();
+        const indent = "  ".repeat(nesting); 
+        md += `${indent}* ${text}\n`;
+      }
+      else if (type === DocumentApp.ElementType.TABLE) {
+         md += "[Table content skipped]\n\n";
+      }
+    }
+    return md;
+  } catch(e) {
+    Logger.log("Markdown generation error: " + e.message);
+    return "Error: " + e.message;
+  }
+}
+
+// ================= UTILITIES (Standard) =================
+function cleanupOrphans(state, activeTabIds, markdownSheetMap) {
+  const allKnownTabIds = Object.keys(state);
   allKnownTabIds.forEach(tabId => {
-    // If the tab ID from history is NOT in the current document structure
     if (!activeTabIds.has(tabId)) {
       const orphanData = state[tabId];
-      Logger.log(`🗑️ Tab removed (ID: ${tabId}). Cleaning up Drive...`);
+      Logger.log(`🗑️ Cleanup: ${tabId}`);
 
-      // 1. Delete PDF
       if (orphanData.fileId) {
-        try {
-          DriveApp.getFileById(orphanData.fileId).setTrashed(true);
-          logToSheet('Cleanup', `Deleted PDF for removed tab`, 'Success');
-        } catch (e) {}
+        try { DriveApp.getFileById(orphanData.fileId).setTrashed(true); } catch (e) {}
       }
-
-      // 2. Delete Folder
       if (orphanData.folderId) {
         try {
           const folder = DriveApp.getFolderById(orphanData.folderId);
-          // 3. Only delete if empty
-          if (!folder.getFiles().hasNext() && !folder.getFolders().hasNext()) {
-             folder.setTrashed(true);
-             logToSheet('Cleanup', `Deleted empty folder for removed tab`, 'Success');
-          }
+          if (!folder.getFiles().hasNext() && !folder.getFolders().hasNext()) folder.setTrashed(true);
         } catch (e) {}
       }
-
-      // 4. Remove from state object
+      if (orphanData.title) {
+        syncToMarkdownSheet(markdownSheetMap, orphanData.title, null, 'Archived', null);
+      }
       delete state[tabId];
       SCRIPT_PROPERTIES.deleteProperty(`hash_${tabId}`);
     }
   });
 }
 
-// --- HELPER FUNCTIONS ---
-
 function moveItemToFolder(item, targetFolder) {
   const parents = item.getParents();
   let isAlreadyHere = false;
-  // Check if it's already in the target folder
   while (parents.hasNext()) {
     const parent = parents.next();
-    if (parent.getId() === targetFolder.getId()) {
-      isAlreadyHere = true;
-    } else {
-      // Remove from old parent (Fixes duplication/ghosting)
+    if (parent.getId() === targetFolder.getId()) isAlreadyHere = true;
+    else {
       try { parent.removeFile(item); } catch (e) { 
         try { parent.removeFolder(item); } catch(e2) {}
       }
     }
   }
-  // Add to new parent if needed
   if (!isAlreadyHere) {
     try { targetFolder.addFile(item); } catch (e) {
        try { targetFolder.addFolder(item); } catch(e2) {}
@@ -309,12 +421,8 @@ function moveItemToFolder(item, targetFolder) {
   }
 }
 
-function safeRenameFile(id, name) {
-  try { DriveApp.getFileById(id).setName(name); } catch(e) {}
-}
-function safeRenameFolder(id, name) {
-  try { DriveApp.getFolderById(id).setName(name); } catch(e) {}
-}
+function safeRenameFile(id, name) { try { DriveApp.getFileById(id).setName(name); } catch(e) {} }
+function safeRenameFolder(id, name) { try { DriveApp.getFolderById(id).setName(name); } catch(e) {} }
 
 function getStoredState() {
   const json = SCRIPT_PROPERTIES.getProperty(STATE_KEY);
@@ -336,10 +444,20 @@ function getOrCreateFolder(parentFolder, folderName) {
   return parentFolder.createFolder(folderName);
 }
 
+function getDrivePath(file) {
+  try {
+    let path = [file.getName()];
+    let parent = file.getParents().hasNext() ? file.getParents().next() : null;
+    while (parent) {
+      path.unshift(parent.getName());
+      parent = parent.getParents().hasNext() ? parent.getParents().next() : null;
+    }
+    return path.join(' / ');
+  } catch (e) { return "Unknown Path"; }
+}
+
 function exportTabToPDF(documentId, tabId, tabTitle, folder) {
   const exportUrl = `https://docs.google.com/document/d/${documentId}/export?format=pdf&tab=${tabId}`;
-  
-  // Construct new filename with prefix/suffix
   const pdfFileName = `${FILENAME_PREFIX}${tabTitle}${FILENAME_SUFFIX}.pdf`;
 
   for (let i = 0; i <= MAX_RETRIES; i++) {
@@ -348,17 +466,12 @@ function exportTabToPDF(documentId, tabId, tabTitle, folder) {
         headers: { 'Authorization': `Bearer ${ScriptApp.getOAuthToken()}` },
         muteHttpExceptions: true
       });
-      
       if (response.getResponseCode() === 200) {
         const blob = response.getBlob().setName(pdfFileName);
-        
-        // Remove existing file with same name to prevent duplicates
         const existing = folder.getFilesByName(pdfFileName);
         while (existing.hasNext()) existing.next().setTrashed(true);
-        
         return folder.createFile(blob);
       }
-      
       if (response.getResponseCode() === 429) {
         Utilities.sleep(INITIAL_BACKOFF * Math.pow(2, i));
         continue;
@@ -378,24 +491,110 @@ function logToSheet(type, msg, status) {
   } catch(e) {}
 }
 
-// Setup function - run this once
 function setupTimeDrivenTrigger() {
   const triggers = ScriptApp.getProjectTriggers();
   triggers.forEach(trigger => {
-    if (trigger.getHandlerFunction() === 'exportUpdatedTabsToPDF') {
-      ScriptApp.deleteTrigger(trigger);
-    }
+    if (trigger.getHandlerFunction() === 'exportUpdatedTabsToPDF') ScriptApp.deleteTrigger(trigger);
   });
-  
-  ScriptApp.newTrigger('exportUpdatedTabsToPDF')
-    .timeBased()
-    .everyMinutes(1)
-    .create();
+  ScriptApp.newTrigger('exportUpdatedTabsToPDF').timeBased().everyMinutes(1).create();
   Logger.log('Trigger set up.');
 }
 
 function forceExportAllTabs() {
-  // Clear both the state/hashes AND the lock
-  SCRIPT_PROPERTIES.deleteAllProperties(); 
-  exportUpdatedTabsToPDF();
+  if (!lockCheck()){
+    return;
+  }
+  lockSet();
+  try {
+    Logger.log('Starting force export...');
+    clearMarkdownSheet();
+    cleanDriveUsingTrackedState(getStoredState());
+    SCRIPT_PROPERTIES.deleteAllProperties(); 
+    
+    // Re-set the lock after deleteAllProperties wiped it
+    lockSet();
+    
+    exportUpdatedTabsToPDF();
+    
+  } catch (e) {
+    Logger.log(`❌ Force export error: ${e.message}`);
+    logToSheet('Error', e.message, 'Failed');
+  } finally {
+    lockRelease();
+  }
+}
+
+/**
+ * Completely wipes the Markdown sheet.  
+ */
+function clearMarkdownSheet() {
+  if (!MARKDOWN_SHEET_ID) return;
+  try {
+    const sheet = SpreadsheetApp.openById(MARKDOWN_SHEET_ID).getSheets()[0];
+    sheet.clear(); 
+  } catch (e) {
+    Logger.log("Error clearing sheet: " + e.message);
+  }
+}
+
+/**
+ * Iterates through the provided state object and trashes 
+ * the associated files and folders in Google Drive.
+ * * @param {Object} state - The JSON object retrieved from SCRIPT_PROPERTIES
+ */
+function cleanDriveUsingTrackedState(state) {
+  if (!state || Object.keys(state).length === 0) return;
+
+  Logger.log(`🗑️ Cleaning ${Object.keys(state).length} tracked items from Drive...`);
+  
+  Object.values(state).forEach(entry => {
+    if (entry.fileId) {
+      try { DriveApp.getFileById(entry.fileId).setTrashed(true); } catch (e) {}
+    }
+    if (entry.folderId) {
+      try { DriveApp.getFolderById(entry.folderId).setTrashed(true); } catch (e) {}
+    }
+  });
+}
+
+function forceResetState(){
+  if (!lockCheck()){
+    return;
+  }
+  lockSet();
+  try{
+    // 1. Mark Markdown sheet's all rows as Archived
+    clearMarkdownSheet();
+    // 2. Physical Wipe: Delete files/folders tracked in current state
+    // (Idempotent: Safe to re-run if it times out)
+    cleanDriveUsingTrackedState(getStoredState());
+    // 3. Logical Wipe: Clear state.
+    SCRIPT_PROPERTIES.deleteAllProperties();
+  }
+  catch (e) {
+    Logger.log("Exception occurred resetting state or archiving the sheet.");
+    logToSheet('Error', e.message, 'Failed');
+  }
+  finally{
+    lockRelease();
+  }
+}
+
+// Obsolete: replaced by clearMarkdownSheet.
+function archiveAllSheetRows() {
+  if (!MARKDOWN_SHEET_ID) return;
+  try {
+    const sheet = SpreadsheetApp.openById(MARKDOWN_SHEET_ID).getSheets()[0];
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return;
+    
+    // Set all status cells (column 3) to "Archived"
+    const statusRange = sheet.getRange(1, 3, lastRow - 1, 1);
+    const values = statusRange.getValues().map(() => ['Archived']);
+    statusRange.setValues(values);
+    
+    Logger.log(`Pre-archived ${lastRow - 1} rows before force export`);
+  } catch(e) {
+    Logger.log("Error pre-archiving: " + e.message);
+  }
 }
